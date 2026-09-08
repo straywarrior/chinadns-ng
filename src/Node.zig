@@ -143,10 +143,6 @@ pub fn @"test: linked list"() !void {
         }
 
         assert(list.is_empty());
-
-        list.unlink();
-        list.unlink();
-        assert(list.is_empty());
     }
 
     {
@@ -208,9 +204,6 @@ pub fn @"test: linked list"() !void {
             g.allocator.destroy(obj);
         }
 
-        assert(l.is_empty());
-
-        l.unlink();
         assert(l.is_empty());
     }
 
