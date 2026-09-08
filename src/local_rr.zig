@@ -14,9 +14,9 @@ var _name_to_records: std.StringHashMapUnmanaged(Records) = .{};
 /// ["*.internal.xx.com"] => 记录，key = 去掉 "*. " 前缀后的后缀域 wire 格式（不含末尾 null）
 var _wild_name_to_records: std.StringHashMapUnmanaged(Records) = .{};
 
-/// dns.qname_domains 的 interest_levels：只查 level 2..8。
-/// level 1（完整 qname）由精确表处理，同时保证通配永不匹配 apex。
-const WILD_INTEREST_LEVELS: u8 = 0b1111_1110;
+/// dns.qname_domains 的 interest_levels：查 level 1..8。
+/// apex（完整 qname）由精确表处理，通配永不匹配 apex —— 在 find_wild_records 中按指针跳过。
+const WILD_INTEREST_LEVELS: u8 = 0b1111_1111;
 
 const Records = struct {
     ipv4: []RR_A = &.{},
@@ -112,20 +112,19 @@ pub fn read_hosts(path: []const u8) ?void {
     }
 }
 
-/// for opt.zig
-pub noinline fn add_ip(ascii_name: []const u8, str_ip: []const u8) ?void {
+fn add_ip_to(map: *std.StringHashMapUnmanaged(Records), name: []const u8, str_ip: []const u8) ?void {
     const src = @src();
 
     var name_buf: [c.DNS_NAME_WIRE_MAXLEN]u8 = undefined;
-    const name_z = dns.ascii_to_wire(ascii_name, &name_buf, null) orelse {
-        opt.print(src, "invalid domain", ascii_name);
+    const name_z = dns.ascii_to_wire(name, &name_buf, null) orelse {
+        opt.print(src, "invalid domain", name);
         return null;
     };
-    const name = name_z[0 .. name_z.len - 1];
+    const name_wire = name_z[0 .. name_z.len - 1];
 
-    const res = _name_to_records.getOrPut(g.allocator, name) catch unreachable;
+    const res = map.getOrPut(g.allocator, name_wire) catch unreachable;
     if (!res.found_existing) {
-        res.key_ptr.* = g.allocator.dupe(u8, name) catch unreachable;
+        res.key_ptr.* = g.allocator.dupe(u8, name_wire) catch unreachable;
         res.value_ptr.* = .{};
     }
 
@@ -137,8 +136,40 @@ pub noinline fn add_ip(ascii_name: []const u8, str_ip: []const u8) ?void {
     res.value_ptr.add_ip(net_ip);
 }
 
+/// for opt.zig; "*.internal.xx.com" 入通配表，其余入精确表
+pub noinline fn add_ip(ascii_name: []const u8, str_ip: []const u8) ?void {
+    if (ascii_name.len >= 2 and ascii_name[0] == '*' and ascii_name[1] == '.')
+        return add_ip_to(&_wild_name_to_records, ascii_name[2..], str_ip);
+    return add_ip_to(&_name_to_records, ascii_name, str_ip);
+}
+
+/// 查 qname 各级真后缀（最深→最浅）中的通配记录；永不匹配 apex（完整 qname）
+fn find_wild_records(msg: []const u8, qnamelen: c_int) ?*Records {
+    if (_wild_name_to_records.count() == 0)
+        return null;
+
+    // apex 自身由精确表处理，通配只匹配其真后缀
+    const apex = dns.get_qname(msg, qnamelen);
+
+    var domains: [8][*]const u8 = undefined;
+    var domain_end: [*]const u8 = undefined;
+    const n = dns.qname_domains(msg, qnamelen, WILD_INTEREST_LEVELS, &domains, &domain_end) orelse return null;
+
+    // qname_domains 按 level 从 N（完整 qname）递减填充，故 domains[0..] 即最深→最浅。
+    // 跳过 apex（仅当其 level ≤ 8 时才在数组中），其余顺序即最深通配优先。
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (domains[i] == apex.ptr)
+            continue;
+        const suffix_len = cc.ptrdiff_u(u8, domain_end, domains[i]); // 与 cache_ignore.zig:57 一致
+        if (_wild_name_to_records.getPtr(domains[i][0..suffix_len])) |records|
+            return records;
+    }
+    return null;
+}
+
 pub fn find_answer(msg: []const u8, qnamelen: c_int, p_answer_n: *u16) ?[]const u8 {
-    if (_name_to_records.count() == 0)
+    if (_name_to_records.count() == 0 and _wild_name_to_records.count() == 0)
         return null;
 
     const qtype = dns.get_qtype(msg, qnamelen);
@@ -146,7 +177,8 @@ pub fn find_answer(msg: []const u8, qnamelen: c_int, p_answer_n: *u16) ?[]const 
         return null;
 
     const qname = dns.get_qname(msg, qnamelen);
-    const records = _name_to_records.getPtr(qname) orelse return null;
+    const records = _name_to_records.getPtr(qname) orelse
+        find_wild_records(msg, qnamelen) orelse return null;
 
     switch (qtype) {
         c.DNS_TYPE_A => {
