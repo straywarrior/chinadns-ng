@@ -580,6 +580,11 @@ group-upstream 192.168.1.1
 - `hosts` 加载 hosts 文件，参数默认值为 `/etc/hosts`，此选项可多次指定。
 - `dns-rr-ip` 定义本地的 A/AAAA 记录（与 hosts 类似），此选项可多次指定。
   - 格式：`<names>=<ips>`，多个 name 使用逗号隔开，多个 ip 使用逗号隔开。
+  - name 支持通配符 `*.` 前缀（仅限最左侧），表示**泛解析**：如 `--dns-rr-ip '*.internal.xx.com=192.168.31.204'` 会使 `internal.xx.com` 的所有**子域**（`a.internal.xx.com`、`a.b.internal.xx.com` 等）解析到该 IP。
+  - `internal.xx.com` 本身**不**匹配通配条目；若 apex 也需要解析，请再添加一条精确记录 `internal.xx.com=192.168.31.204`。
+  - 精确记录优先于通配记录；多个通配嵌套时，最深层（最具体）的通配优先。
+  - `hosts` 文件与 `dns-rr-ip` 共享解析路径，hosts 文件中的 `ip *.name` 同样适用。
+  - 与域名列表一致，最多匹配 8 级后缀。
 
 ### cert-verify、ca-certs
 

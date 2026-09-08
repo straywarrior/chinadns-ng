@@ -48,7 +48,7 @@ const help =
     \\ --verdict-cache <size>               enable verdict caching for tag:none domains
     \\ --verdict-cache-db <path>            verdict cache persistence (from/to db file)
     \\ --hosts [path]                       load hosts file, default path is /etc/hosts
-    \\ --dns-rr-ip <names>=<ips>            define local resource records of type A/AAAA
+    \\ --dns-rr-ip <names>=<ips>            define local resource records of type A/AAAA (*. suffix = wildcard)
     \\ --cert-verify                        enable SSL certificate validation, default: no
     \\ --ca-certs <path>                    CA certs path for SSL certificate validation
     \\ --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist

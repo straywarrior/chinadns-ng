@@ -27,7 +27,7 @@
 - 本地命中应答 TTL=0，不加 ipset/nftset，先于 tag 分组/缓存/转发。
 - 只定义单族 IP 时，另一族查询返回 NODATA（空 answer）。
 - `--dns-rr-ip '<names>=<ips>'` 支持逗号分隔多 name / 多 ip，由 `opt.zig#opt_dns_rr_ip` 循环调用 `local_rr.add_ip(name, ip)`。
-- 底层已有 `dns_qname_domains(msg, qnamelen, interest_levels, domains[8], p_domain_end)`（`src/dns.c:562`）：按 label 将 qname 逐级切成至多 8 个 wire 格式**后缀**，`interest_levels` 为位掩码（bit L-1 表示要第 L 级），返回域指针升序（L 升序 = 特异性降序）。
+- 底层已有 `dns_qname_domains(msg, qnamelen, interest_levels, domains[8], p_domain_end)`（`src/dns.c:562`）：按 label 将 qname 逐级切成至多 8 个 wire 格式**后缀**，`interest_levels` 为位掩码（bit L-1 表示要第 L 级），域指针按 level 从 N（完整 qname）递减填充（`domains[0]` = 最完整/特异性最高，逐级向后递减）。
 
 ## 设计
 
@@ -62,20 +62,20 @@ value 复用现有 `Records`，多 IP 去重、A/AAAA 分族行为均不变。
 if 精确表命中            return Records        // 现有逻辑
 if 通配表为空            return null
 if qtype 非 A/AAAA       return null           // 与现状一致
-qname_domains(msg, qnamelen, interest_levels = levels 2..8, &domains[8], &domain_end)
-// 跳过 level 1（level 1 = 完整 qname，精确表已查过） ⇒ 天然不覆盖 apex
-for 每个后缀 (level 升序 = 特异性降序):
+qname_domains(msg, qnamelen, interest_levels = levels 1..8, &domains[8], &domain_end)
+// domains[0..] 从 level N（完整 qname = apex）填充至 level 1；按指针跳过 apex ⇒ 天然不覆盖 apex
+for 每个后缀 (level 降序 = 特异性降序):
     if 通配表命中该后缀     return Records        // 最深匹配优先
 return null
 ```
 
-- `interest_levels = 0b1111_1110`（只关心 level 2..8）。`qname_domains` 在 qname 级数 < 2 时返回 0，直接跳过。
+- `interest_levels = 0b1111_1111`（level 1..8）。`qname_domains` 按 level 从 N 递减填充 `domains[0..]`（`domains[0]` 即完整 qname = apex），且只收集 `qname_level <= 8` 的后缀。apex 自身由精确表处理，通配查找中按 `domains[i] == dns.get_qname(msg).ptr` 指针跳过，故通配只匹配其**真后缀**。
 - 待查后缀字节区间为 `domains[i][0 .. p_domain_end - domains[i]]`，与通配表 key（wire 格式、无末尾 null）一致。
 - 匹配演示（`*.internal.xx.com`，key=`internal.xx.com`）：
-  - `a.internal.xx.com`（4 级）→ level 2 = `internal.xx.com` → 命中 ✓
-  - `a.b.internal.xx.com`（5 级）→ level 3 = `internal.xx.com` → 命中 ✓
-  - `internal.xx.com`（3 级）→ 仅 level 1，通配不查 → 不覆盖 apex ✓
-  - 同时存在 `*.b.xx.com` 与 `*.xx.com` 时 → level 2 先于 level 3 命中，`*.b.xx.com` 优先 ✓
+  - `a.internal.xx.com`（4 级）→ domains[1] = `internal.xx.com` → 命中 ✓
+  - `a.b.internal.xx.com`（5 级）→ domains[2] = `internal.xx.com` → 命中 ✓
+  - `internal.xx.com`（3 级）→ domains[0] = 完整 qname = apex，指针跳过 → 不覆盖 apex ✓
+  - 同时存在 `*.b.xx.com` 与 `*.xx.com` 时 → `b.xx.com`（更深）先于 `xx.com` 命中，`*.b.xx.com` 优先 ✓
 
 通配命中复用现有应答构造路径（`dns.make_reply`），`server.zig` 无需修改。日志沿用 `qlog.local_rr`。
 
