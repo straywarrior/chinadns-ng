@@ -11,7 +11,7 @@ const assert = std.debug.assert;
 /// - name does not include the null label
 var _name_to_records: std.StringHashMapUnmanaged(Records) = .{};
 
-/// ["*.internal.xx.com"] => 记录，key = 去掉 "*. " 前缀后的后缀域 wire 格式（不含末尾 null）
+/// ["*.internal.xx.com"] => 记录，key = 去掉 `*.` 前缀后的后缀域 wire 格式（不含末尾 null）
 var _wild_name_to_records: std.StringHashMapUnmanaged(Records) = .{};
 
 /// dns.qname_domains 的 interest_levels：查 level 1..8。
@@ -157,12 +157,11 @@ fn find_wild_records(msg: []const u8, qnamelen: c_int) ?*Records {
 
     // qname_domains 按 level 从 N（完整 qname）递减填充，故 domains[0..] 即最深→最浅。
     // 跳过 apex（仅当其 level ≤ 8 时才在数组中），其余顺序即最深通配优先。
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (domains[i] == apex.ptr)
+    for (domains[0..n]) |domain| {
+        if (domain == apex.ptr)
             continue;
-        const suffix_len = cc.ptrdiff_u(u8, domain_end, domains[i]); // 与 cache_ignore.zig:57 一致
-        if (_wild_name_to_records.getPtr(domains[i][0..suffix_len])) |records|
+        const suffix_len = cc.ptrdiff_u(u8, domain_end, domain); // 与 cache_ignore.zig:57 一致
+        if (_wild_name_to_records.getPtr(domain[0..suffix_len])) |records|
             return records;
     }
     return null;
