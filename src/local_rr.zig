@@ -11,6 +11,13 @@ const assert = std.debug.assert;
 /// - name does not include the null label
 var _name_to_records: std.StringHashMapUnmanaged(Records) = .{};
 
+/// ["*.internal.xx.com"] => 记录，key = 去掉 "*. " 前缀后的后缀域 wire 格式（不含末尾 null）
+var _wild_name_to_records: std.StringHashMapUnmanaged(Records) = .{};
+
+/// dns.qname_domains 的 interest_levels：只查 level 2..8。
+/// level 1（完整 qname）由精确表处理，同时保证通配永不匹配 apex。
+const WILD_INTEREST_LEVELS: u8 = 0b1111_1110;
+
 const Records = struct {
     ipv4: []RR_A = &.{},
     ipv6: []RR_AAAA = &.{},
@@ -152,4 +159,145 @@ pub fn find_answer(msg: []const u8, qnamelen: c_int, p_answer_n: *u16) ?[]const 
         },
         else => unreachable,
     }
+}
+
+fn deinit_map(map: *std.StringHashMapUnmanaged(Records)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        g.allocator.free(entry.key_ptr.*);
+        g.allocator.free(entry.value_ptr.ipv4);
+        g.allocator.free(entry.value_ptr.ipv6);
+    }
+    map.deinit(g.allocator);
+    // std 0.10.1 HashMapUnmanaged.deinit 将 self 置为 undefined；
+    // 测试函数间复用全局 map，须重新初始化，否则下一次 getOrPut 读到非法 metadata
+    map.* = .{};
+}
+
+/// 释放所有记录；仅测试调用（守护进程经 cc.exit 退出，不调用）
+pub fn deinit() void {
+    deinit_map(&_name_to_records);
+    deinit_map(&_wild_name_to_records);
+}
+
+const testing = std.testing;
+
+fn put_u16(buf: []u8, off: usize, v: u16) void {
+    buf[off] = @intCast(u8, v >> 8);
+    buf[off + 1] = @intCast(u8, v & 0xff);
+}
+
+const TestQuery = struct { msg: []const u8, qnamelen: c_int };
+
+/// header(12) + qname(wire, 含末尾 null) + qtype(2) + qclass(2)
+fn make_query(buf: *[512]u8, ascii_name: []const u8, qtype: u16) TestQuery {
+    put_u16(buf, 0, 0);      // id
+    put_u16(buf, 2, 0x0100); // flags: RD
+    put_u16(buf, 4, 1);      // qdcount
+    put_u16(buf, 6, 0);      // ancount
+    put_u16(buf, 8, 0);      // nscount
+    put_u16(buf, 10, 0);     // arcount
+
+    var i: usize = 12;
+    var name_buf: [c.DNS_NAME_WIRE_MAXLEN]u8 = undefined;
+    const wire = dns.ascii_to_wire(ascii_name, &name_buf, null).?;
+    @memcpy(buf[i..].ptr, wire.ptr, wire.len);
+    const qnamelen = wire.len;
+    i += wire.len;
+
+    put_u16(buf, i, qtype);
+    i += 2;
+    put_u16(buf, i, c.DNS_CLASS_IN);
+    i += 2;
+
+    return .{ .msg = buf[0..i], .qnamelen = @intCast(c_int, qnamelen) };
+}
+
+/// add_ip 失败（返回 null）时让测试以 error 退出
+fn must_add_ip(name: []const u8, ip: []const u8) !void {
+    if (add_ip(name, ip) == null)
+        return error.InvalidArg;
+}
+
+/// RR_A/RR_AAAA 为 packed 布局：name(2) type(2) class(2) ttl(4) datalen(2) data(..)，data 偏移 12
+const ANSWER_DATA_OFFSET = 2 * 3 + 4 + 2;
+
+pub fn @"test: wildcard subdomain"() !void {
+    defer deinit();
+    try must_add_ip("*.internal.xx.com", "192.168.31.204");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "a.internal.xx.com", c.DNS_TYPE_A);
+    var n: u16 = undefined;
+    const answer = find_answer(q.msg, q.qnamelen, &n) orelse return error.NoMatch;
+    try testing.expectEqual(@as(u16, 1), n);
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 31, 204 }, answer[ANSWER_DATA_OFFSET..][0..4]);
+
+    // AAAA 查询命中同一通配项，但未配 v6 IP -> NODATA（answer_n = 0）
+    const q6 = make_query(&buf, "a.internal.xx.com", c.DNS_TYPE_AAAA);
+    var n6: u16 = undefined;
+    const a6 = find_answer(q6.msg, q6.qnamelen, &n6) orelse return error.NoMatch;
+    try testing.expectEqual(@as(u16, 0), n6);
+    try testing.expect(a6.len == 0);
+}
+
+pub fn @"test: wildcard apex miss"() !void {
+    defer deinit();
+    try must_add_ip("*.internal.xx.com", "192.168.31.204");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "internal.xx.com", c.DNS_TYPE_A);
+    var n: u16 = undefined;
+    try testing.expect(find_answer(q.msg, q.qnamelen, &n) == null);
+}
+
+pub fn @"test: wildcard deepest wins"() !void {
+    defer deinit();
+    try must_add_ip("*.b.xx.com", "1.1.1.1");
+    try must_add_ip("*.xx.com", "2.2.2.2");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "x.y.b.xx.com", c.DNS_TYPE_A);
+    var n: u16 = undefined;
+    const answer = find_answer(q.msg, q.qnamelen, &n) orelse return error.NoMatch;
+    try testing.expectEqual(@as(u16, 1), n);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, answer[ANSWER_DATA_OFFSET..][0..4]);
+}
+
+pub fn @"test: exact over wildcard"() !void {
+    defer deinit();
+    try must_add_ip("a.internal.xx.com", "3.3.3.3");
+    try must_add_ip("*.internal.xx.com", "2.2.2.2");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "a.internal.xx.com", c.DNS_TYPE_A);
+    var n: u16 = undefined;
+    const answer = find_answer(q.msg, q.qnamelen, &n) orelse return error.NoMatch;
+    try testing.expectEqual(@as(u16, 1), n);
+    try testing.expectEqualSlices(u8, &.{ 3, 3, 3, 3 }, answer[ANSWER_DATA_OFFSET..][0..4]);
+}
+
+pub fn @"test: wildcard multi names and ips"() !void {
+    defer deinit();
+    try must_add_ip("*.a", "1.2.3.4");
+    try must_add_ip("*.a", "5.6.7.8");
+    try must_add_ip("*.b", "5.6.7.8");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "x.a", c.DNS_TYPE_A);
+    var n: u16 = undefined;
+    const answer = find_answer(q.msg, q.qnamelen, &n) orelse return error.NoMatch;
+    try testing.expectEqual(@as(u16, 2), n); // 两条 A 记录
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, answer[ANSWER_DATA_OFFSET..][0..4]);
+    try testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, answer[ANSWER_DATA_OFFSET + 16 ..][0..4]);
+}
+
+pub fn @"test: wildcard non A AAAA"() !void {
+    defer deinit();
+    try must_add_ip("*.internal.xx.com", "192.168.31.204");
+
+    var buf: [512]u8 = undefined;
+    const q = make_query(&buf, "a.internal.xx.com", c.DNS_TYPE_OPT); // 非 A/AAAA 不查本地表
+    var n: u16 = undefined;
+    try testing.expect(find_answer(q.msg, q.qnamelen, &n) == null);
 }
